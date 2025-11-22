@@ -1,0 +1,22 @@
+# MLX Integration Requirements
+# Install with: pip install -r requirements-mlx.txt
+
+# Core MLX framework
+mlx>=0.30.0
+
+# MLX LLM support (language models)
+mlx-lm>=0.20.0
+
+# MLX VLM support (vision-language models)
+mlx-vlm>=0.2.0
+
+# MLX Audio support (STT + TTS)
+mlx-audio>=0.2.5
+
+# Optional: For CUDA support on NVIDIA GPUs
+# Uncomment on Linux with NVIDIA GPU:
+# mlx[cuda]>=0.30.0
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# pytest-asyncio>=0.21.0
