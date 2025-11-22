@@ -27,6 +27,9 @@ from reachy_mini_conversation_app.mlx import (
     get_memory_info,
     ConversationState,
     ConversationStateMachine,
+    STTProcessor,
+    TTSProcessor,
+    SimpleVAD,
 )
 from reachy_mini_conversation_app.mlx.llm import MLXLanguageModel
 
@@ -37,21 +40,21 @@ logger = logging.getLogger(__name__)
 class MLXRealtimeHandler(AsyncStreamHandler):
     """MLX-based realtime handler for local LLM processing.
 
-    Sprint 1: Foundation (Current)
+    Sprint 1: Foundation ✅
     - Basic handler structure
     - LLM model loading
     - State machine integration
-    - Placeholder audio methods
 
-    Sprint 2: Audio (Next)
-    - STT integration
-    - TTS integration
-    - Full audio pipeline
+    Sprint 2: Audio ✅ (Current)
+    - STT integration (Whisper)
+    - TTS integration (Kokoro-82M)
+    - VAD for turn detection
+    - Full conversation pipeline
 
-    Sprint 3: Features
-    - Tool calling
-    - Vision integration
-    - Error handling
+    Sprint 3: Features (Next)
+    - Tool calling integration
+    - Vision integration (SmolVLM)
+    - Advanced error handling
     """
 
     def __init__(
@@ -82,9 +85,13 @@ class MLXRealtimeHandler(AsyncStreamHandler):
 
         # MLX components (loaded in start_up)
         self.llm: MLXLanguageModel | None = None
-        # TODO Sprint 2: Add STT and TTS models
-        # self.stt: MLXAudioProcessor | None = None
-        # self.tts: MLXAudioProcessor | None = None
+        self.stt: STTProcessor | None = None
+        self.tts: TTSProcessor | None = None
+        self.vad: SimpleVAD | None = None
+
+        # Audio buffering for STT
+        self.audio_buffer: list[NDArray[np.int16]] = []
+        self.is_recording = False
 
         # State machine
         self.state_machine = ConversationStateMachine(
@@ -142,10 +149,34 @@ class MLXRealtimeHandler(AsyncStreamHandler):
             logger.error(f"Failed to load LLM: {e}")
             raise
 
-        # TODO Sprint 2: Load audio models
-        # logger.info("Loading STT and TTS models...")
-        # self.stt = load_stt_model(self.config)
-        # self.tts = load_tts_model(self.config)
+        # Load audio models
+        logger.info("Loading STT model...")
+        self.stt = STTProcessor()
+        try:
+            self.stt.load()
+            logger.info("✅ STT loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load STT: {e}")
+            raise
+
+        logger.info(f"Loading TTS model: {self.config.tts_model}")
+        self.tts = TTSProcessor(
+            model_path=self.config.tts_model,
+            voice=self.config.tts_voice,
+            speed=self.config.tts_speed,
+            lang_code=self.config.tts_lang_code,
+            sample_rate=self.output_sample_rate,
+        )
+        try:
+            self.tts.load()
+            logger.info("✅ TTS loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load TTS: {e}")
+            raise
+
+        # Initialize VAD
+        self.vad = SimpleVAD(sample_rate=self.input_sample_rate)
+        logger.info("✅ VAD initialized")
 
         # Add system message
         system_prompt = self._get_system_prompt()
@@ -156,26 +187,51 @@ class MLXRealtimeHandler(AsyncStreamHandler):
         logger.info("=" * 60)
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
-        """Receive audio frame from microphone.
+        """Receive audio frame from microphone and process with STT.
 
-        Sprint 1: Placeholder (no processing)
-        Sprint 2: Will implement STT processing
+        Pipeline:
+        1. Use VAD to detect speech
+        2. Buffer audio while speaking
+        3. When speech ends, transcribe buffer
+        4. Send transcription to LLM
+        5. Generate TTS response
 
         Args:
             frame: (sample_rate, audio_array) from microphone
         """
-        # TODO Sprint 2: Implement STT processing
-        # For now, just log that we're receiving audio
         _, array = frame
-        logger.debug(f"Received audio frame: {array.shape}")
 
-        # Update state to LISTENING if we detect audio
-        # (In Sprint 2, we'll use VAD here)
-        if self.state_machine.current_state == ConversationState.IDLE:
+        # Check for speech using VAD
+        has_speech = self.vad.is_speech(array)
+
+        if has_speech and not self.is_recording:
+            # Speech started
+            self.is_recording = True
+            self.audio_buffer = [array]
             self.state_machine.transition_to(
-                ConversationState.LISTENING,
-                "Audio input detected"
+                ConversationState.LISTENING, "Speech detected"
             )
+            logger.debug("Started recording audio")
+
+        elif has_speech and self.is_recording:
+            # Continue recording
+            self.audio_buffer.append(array)
+
+        elif not has_speech and self.is_recording:
+            # Speech ended - process buffered audio
+            self.is_recording = False
+            logger.debug(f"Speech ended, processing {len(self.audio_buffer)} frames")
+
+            # Transition to processing state
+            self.state_machine.transition_to(
+                ConversationState.PROCESSING, "Speech ended, transcribing"
+            )
+
+            # Process audio in background task (don't block receive)
+            asyncio.create_task(self._process_speech_buffer())
+
+            # Clear buffer
+            self.audio_buffer = []
 
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
         """Emit audio frame to speaker.
@@ -186,9 +242,119 @@ class MLXRealtimeHandler(AsyncStreamHandler):
         Returns:
             Audio frame or metadata for the stream
         """
-        # TODO Sprint 2: Return actual TTS audio
-        # For now, return items from queue or None
+        # Emit items from queue (TTS audio or metadata)
         return await wait_for_item(self.output_queue)  # type: ignore[no-any-return]
+
+    async def _process_speech_buffer(self) -> None:
+        """Process buffered speech through STT → LLM → TTS pipeline.
+
+        This is the core conversation loop:
+        1. Transcribe audio buffer with STT
+        2. Send transcription to LLM
+        3. Generate TTS audio from LLM response
+        4. Queue audio for playback
+        """
+        if not self.audio_buffer:
+            logger.warning("Empty audio buffer, skipping processing")
+            self.state_machine.transition_to(ConversationState.IDLE, "Empty buffer")
+            return
+
+        try:
+            # Step 1: Transcribe audio (STT)
+            logger.info("Transcribing audio...")
+            combined_audio = np.concatenate(self.audio_buffer)
+
+            # Run STT in thread pool (blocking operation)
+            loop = asyncio.get_event_loop()
+            transcription = await loop.run_in_executor(
+                None, self.stt.transcribe_audio, combined_audio, self.input_sample_rate
+            )
+
+            if not transcription:
+                logger.warning("Empty transcription, skipping")
+                self.state_machine.transition_to(ConversationState.IDLE, "Empty transcription")
+                return
+
+            logger.info(f"User said: {transcription}")
+
+            # Send transcription to UI
+            await self.output_queue.put(
+                AdditionalOutputs({"role": "user", "content": transcription})
+            )
+
+            # Step 2: Generate LLM response
+            logger.info("Generating LLM response...")
+            self.llm.add_message("user", transcription)
+
+            # Get tools for function calling
+            tools = get_tool_specs()
+
+            # Apply chat template with tools
+            prompt = self.llm.apply_chat_template(
+                messages=self.llm.get_history(),
+                tools=tools
+            )
+
+            # Generate response in thread pool (blocking)
+            response_text = await loop.run_in_executor(
+                None, self.llm.generate, prompt
+            )
+
+            # TODO Sprint 3: Handle function calls
+            # tool_call = self.llm.parse_function_call(response_text)
+            # if tool_call:
+            #     await self._handle_tool_call(tool_call)
+            #     return
+
+            # Add assistant message to history
+            self.llm.add_message("assistant", response_text)
+            logger.info(f"Assistant response: {response_text}")
+
+            # Send response to UI
+            await self.output_queue.put(
+                AdditionalOutputs({"role": "assistant", "content": response_text})
+            )
+
+            # Step 3: Generate TTS audio
+            logger.info("Generating speech...")
+            self.state_machine.transition_to(
+                ConversationState.SPEAKING, "Generating TTS"
+            )
+
+            # Generate TTS in thread pool (blocking)
+            audio = await loop.run_in_executor(
+                None, self.tts.synthesize, response_text
+            )
+
+            # Convert float32 to int16 for output
+            audio_int16 = (audio * 32767).astype(np.int16)
+
+            # Queue audio for playback (in chunks if needed)
+            chunk_size = 4800  # 200ms at 24kHz
+            for i in range(0, len(audio_int16), chunk_size):
+                chunk = audio_int16[i:i+chunk_size]
+                # Reshape to (1, n_samples) for mono
+                chunk_2d = chunk.reshape(1, -1)
+                await self.output_queue.put((self.output_sample_rate, chunk_2d))
+
+            # Update timing
+            self.last_activity_time = asyncio.get_event_loop().time()
+
+            # Back to idle
+            self.state_machine.transition_to(ConversationState.IDLE, "TTS complete")
+
+        except Exception as e:
+            logger.error(f"Error in speech processing pipeline: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Send error to UI
+            await self.output_queue.put(
+                AdditionalOutputs({"role": "assistant", "content": f"Error: {str(e)}"})
+            )
+
+            # Reset to idle
+            self.state_machine.transition_to(ConversationState.IDLE, "Error occurred")
 
     async def shutdown(self) -> None:
         """Shutdown the handler and cleanup resources."""
@@ -199,9 +365,13 @@ class MLXRealtimeHandler(AsyncStreamHandler):
 
         # Clear models (free memory)
         self.llm = None
-        # TODO Sprint 2: Clear audio models
-        # self.stt = None
-        # self.tts = None
+        self.stt = None
+        self.tts = None
+        self.vad = None
+
+        # Clear audio buffer
+        self.audio_buffer = []
+        self.is_recording = False
 
         # Clear output queue
         while not self.output_queue.empty():
