@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "reachy-robot": {
+      "command": "python",
+      "args": ["-m", "reachy_mcp.server"],
+      "env": {
+        "ROBOT_HOST": "192.168.1.100",
+        "ROBOT_PORT": "50051",
+        "SAFETY_MODE": "strict",
+        "MAX_COMMANDS_PER_MINUTE": "30",
+        "ENABLE_CAMERA": "true",
+        "FACE_TRACKING_MODE": "yolo",
+        "USE_LOCAL_VISION": "false",
+        "OPENAI_API_KEY": "your-openai-api-key-here",
+        "LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}
